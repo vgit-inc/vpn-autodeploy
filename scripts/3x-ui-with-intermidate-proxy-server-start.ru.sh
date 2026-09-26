@@ -6,7 +6,6 @@
 #   sudo bash /tmp/3xui-deploy.sh
 # ============================================================
 set -euo pipefail
-trap '' PIPE
 
 # ---------- Если запущено через pipe — перезапустить из файла ----------
 if [[ ! -t 0 ]] && [[ -z "${__SELF_RELAUNCHED:-}" ]]; then
@@ -143,8 +142,8 @@ echo ""
 # ---------- Генерация секретов ----------
 CERT_DIR="/root/cert/ip"
 CLIENT_UUID="$(cat /proc/sys/kernel/random/uuid)"
-SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)"
-HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)"
+SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)" || true
+HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)" || true
 # Свой webBasePath — генерируем сами, а не даём install.sh выбрать случайный,
 # чтобы точно знать путь для последующих вызовов API и итоговой ссылки.
 WEB_BASE_PATH="$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 18)"
