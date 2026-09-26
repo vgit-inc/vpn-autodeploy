@@ -5,6 +5,17 @@
 # ============================================================
 set -euo pipefail
 
+# ---------- Если запущено через pipe — перезапустить из файла ----------
+# Детект: stdin — не терминал (pipe из curl) И это не перенаправление из файла
+if [[ ! -t 0 ]] && [[ -z "${__SELF_RELAUNCHED:-}" ]]; then
+  echo "[+] Обнаружен запуск через pipe. Перезапуск из файла..."
+  __TMP_SCRIPT="$(mktemp /tmp/deploy-proxy.XXXXXX.sh)"
+  cat > "$__TMP_SCRIPT"
+  chmod +x "$__TMP_SCRIPT"
+  export __SELF_RELAUNCHED=1
+  exec sudo -E bash "$__TMP_SCRIPT" "$@"
+fi
+
 # ---------- Самоперезапуск от root ----------
 if [[ $EUID -ne 0 ]]; then
   echo "[!] Требуется root. Перезапуск через sudo..."
