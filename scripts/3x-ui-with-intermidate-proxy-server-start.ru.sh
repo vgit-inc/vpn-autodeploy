@@ -138,7 +138,7 @@ echo ""
 CERT_DIR="/root/cert/ip"
 CLIENT_UUID="$(cat /proc/sys/kernel/random/uuid)"
 SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)" || true
-HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)"
+HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)" || true
 
 # ---------- 1. Обновление системы и зависимости ----------
 log "Обновление системы и установка зависимостей..."
