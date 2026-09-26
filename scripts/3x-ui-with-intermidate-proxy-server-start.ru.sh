@@ -137,7 +137,7 @@ echo ""
 # ---------- Генерация секретов ----------
 CERT_DIR="/root/cert/ip"
 CLIENT_UUID="$(cat /proc/sys/kernel/random/uuid)"
-SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)"
+SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)" || true
 HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)"
 
 # ---------- 1. Обновление системы и зависимости ----------
