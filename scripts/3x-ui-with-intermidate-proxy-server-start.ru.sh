@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
-# 3x-ui Auto Deploy Script (v4 — интерактивный ввод)
-# Запуск: sudo bash <(curl -Ls https://raw.githubusercontent.com/<USER>/<REPO>/main/deploy-proxy.sh)
+# 3x-ui Auto Deploy Script (v5 — исправленная версия)
+# Запуск (рекомендуется — не через <(...) с sudo, см. ниже):
+#   curl -Ls -o /tmp/3xui-deploy.sh https://raw.githubusercontent.com/vgit-inc/vpn-autodeploy/main/scripts/3x-ui-with-intermidate-proxy-server-start.ru.sh
+#   sudo bash /tmp/3xui-deploy.sh
 # ============================================================
 set -euo pipefail
+trap '' PIPE
 
 # ---------- Если запущено через pipe — перезапустить из файла ----------
-# Детект: stdin — не терминал (pipe из curl) И это не перенаправление из файла
 if [[ ! -t 0 ]] && [[ -z "${__SELF_RELAUNCHED:-}" ]]; then
   echo "[+] Обнаружен запуск через pipe. Перезапуск из файла..."
   __TMP_SCRIPT="$(mktemp /tmp/deploy-proxy.XXXXXX.sh)"
@@ -111,6 +113,10 @@ echo -e "${BLUE}========================================${NC}"
 echo ""
 
 prompt_ip   SERVER_IP        "IP текущего сервера"
+# TODO: INTERMEDIATE_IP пока только собирается, но не используется —
+# автоматическая настройка форвардинга через промежуточный сервер
+# (forwarding_install.sh) будет добавлена отдельным шагом после того,
+# как подтвердим, что установка панели полностью рабочая.
 prompt_ip   INTERMEDIATE_IP  "IP промежуточного сервера"
 prompt_port CONNECT_PORT     "Порт для VLESS TLS (подключения)"
 prompt_port PANEL_PORT       "Порт панели 3x-ui"
@@ -137,8 +143,11 @@ echo ""
 # ---------- Генерация секретов ----------
 CERT_DIR="/root/cert/ip"
 CLIENT_UUID="$(cat /proc/sys/kernel/random/uuid)"
-SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)" || true
-HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)" || true
+SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 16)"
+HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)"
+# Свой webBasePath — генерируем сами, а не даём install.sh выбрать случайный,
+# чтобы точно знать путь для последующих вызовов API и итоговой ссылки.
+WEB_BASE_PATH="$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 18)"
 
 # ---------- 1. Обновление системы и зависимости ----------
 log "Обновление системы и установка зависимостей..."
@@ -148,86 +157,120 @@ apt-get upgrade -y -qq
 apt-get install -y -qq curl wget tar ufw jq openssl cron socat >/dev/null 2>&1
 
 # ---------- 2. Установка 3x-ui ----------
+ALREADY_INSTALLED=0
 if command -v x-ui >/dev/null 2>&1 || systemctl is-active --quiet x-ui 2>/dev/null; then
   warn "3x-ui уже установлен. Пропускаем установку."
+  warn "Логин/пароль/порт/webBasePath из этого запуска НЕ применятся к уже существующей установке — ниже скрипт считает актуальные значения напрямую из настроек панели."
+  ALREADY_INSTALLED=1
 else
   log "Установка 3x-ui (неинтерактивный режим)..."
   export XUI_NONINTERACTIVE=1
   export XUI_USERNAME="$PANEL_USER"
   export XUI_PASSWORD="$PANEL_PASSWORD"
-  export XUI_PORT="$PANEL_PORT"
-  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) >/dev/null 2>&1
-  unset XUI_NONINTERACTIVE XUI_USERNAME XUI_PASSWORD XUI_PORT
+  export XUI_PANEL_PORT="$PANEL_PORT"     # ВАЖНО: именно XUI_PANEL_PORT, а не XUI_PORT
+  export XUI_WEB_BASE_PATH="$WEB_BASE_PATH"
+  export XUI_DB_TYPE=sqlite
+  export XUI_SSL_MODE=ip                  # доверяем сертификат встроенной логике install.sh
+  export XUI_SERVER_IP="$SERVER_IP"       # на случай, если auto-detect IP через внешние сервисы не пройдёт
+  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+  unset XUI_NONINTERACTIVE XUI_USERNAME XUI_PASSWORD XUI_PANEL_PORT XUI_WEB_BASE_PATH XUI_DB_TYPE XUI_SSL_MODE XUI_SERVER_IP
   log "3x-ui установлен."
 fi
 
-# ---------- 3. Файрвол ----------
+# ---------- 3. Читаем РЕАЛЬНЫЕ настройки панели ----------
+# Не доверяем своим же входным данным вслепую: спрашиваем у самого x-ui,
+# на каком порту и по какому webBasePath он реально поднялся.
+log "Считываю фактические настройки панели..."
+XUI_SETTINGS="$(/usr/local/x-ui/x-ui setting -show true 2>/dev/null || true)"
+ACTUAL_PANEL_PORT="$(echo "$XUI_SETTINGS" | grep -E '^port:' | awk -F': ' '{print $2}' | tr -d '[:space:]')"
+ACTUAL_WEB_BASE_PATH_RAW="$(echo "$XUI_SETTINGS" | grep -E '^webBasePath:' | awk -F': ' '{print $2}' | tr -d '[:space:]')"
+# webBasePath хранится в виде "/xxxxx/", для URL нам нужен вариант без лишних слэшей
+ACTUAL_WEB_BASE_PATH="$(echo "$ACTUAL_WEB_BASE_PATH_RAW" | sed 's#^/##; s#/$##')"
+
+if [[ -z "$ACTUAL_PANEL_PORT" ]]; then
+  err "Не удалось определить реальный порт панели через 'x-ui setting -show true'."
+  err "Проверь вручную: x-ui status && x-ui setting -show true"
+  ACTUAL_PANEL_PORT="$PANEL_PORT"
+  warn "Продолжаю с портом из ввода ($PANEL_PORT) — дальнейшие шаги могут не сработать, если он не совпадает с реальным."
+fi
+if [[ -z "$ACTUAL_WEB_BASE_PATH" ]]; then
+  warn "Не удалось определить webBasePath, буду обращаться без префикса (может не сработать)."
+fi
+
+log "Фактический порт панели: $ACTUAL_PANEL_PORT"
+log "Фактический webBasePath: /${ACTUAL_WEB_BASE_PATH}/"
+PANEL_BASE_URL="http://127.0.0.1:${ACTUAL_PANEL_PORT}/${ACTUAL_WEB_BASE_PATH}"
+
+# ---------- 4. Файрвол ----------
 log "Настройка UFW..."
 ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming >/dev/null 2>&1 || true
 ufw default allow outgoing >/dev/null 2>&1 || true
 ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
-ufw allow "$PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
+ufw allow "$ACTUAL_PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
 ufw allow 80/tcp comment "Let's Encrypt HTTP-01" >/dev/null 2>&1 || true
 ufw allow 443/tcp comment 'VLESS main' >/dev/null 2>&1 || true
 ufw allow 8443/udp comment 'Hysteria2' >/dev/null 2>&1 || true
 ufw allow "$CONNECT_PORT/tcp" comment 'VLESS connect' >/dev/null 2>&1 || true
+# Порт сервера подписок (по умолчанию у 3x-ui это 2096, но лучше свериться
+# в панели: Settings -> Subscription Settings -> Subscription Port).
+ufw allow 2096/tcp comment '3x-ui subscription' >/dev/null 2>&1 || true
 ufw --force enable >/dev/null 2>&1 || true
 systemctl enable ufw >/dev/null 2>&1 || true
 log "UFW настроен и сохранён."
 
-# ---------- 4. Запуск 3x-ui ----------
+# ---------- 5. Запуск 3x-ui и ожидание готовности ----------
 log "Запуск 3x-ui..."
 systemctl enable x-ui >/dev/null 2>&1 || true
 systemctl restart x-ui >/dev/null 2>&1 || true
-sleep 5
 
-# ---------- 5. SSL-сертификат для IP ----------
-log "Установка и настройка acme.sh для IP-сертификата..."
-if [[ ! -f ~/.acme.sh/acme.sh ]]; then
-  curl -s https://get.acme.sh | sh -s email=admin@localhost >/dev/null 2>&1
+log "Ожидание готовности панели на порту $ACTUAL_PANEL_PORT..."
+PANEL_READY=0
+for i in $(seq 1 30); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${ACTUAL_PANEL_PORT}") 2>/dev/null; then
+    exec 3>&- 2>/dev/null || true
+    PANEL_READY=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$PANEL_READY" -eq 1 ]]; then
+  log "Панель отвечает на порту $ACTUAL_PANEL_PORT."
+else
+  err "Панель так и не открыла порт $ACTUAL_PANEL_PORT за 30 секунд. Проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
 fi
 
-log "Выпуск Let's Encrypt сертификата для IP $SERVER_IP..."
-~/.acme.sh/acme.sh --issue \
-  -d "$SERVER_IP" \
-  --standalone \
-  --server letsencrypt \
-  --certificate-profile shortlived \
-  --days 5 \
-  --httpport 80 >/dev/null 2>&1 || warn "Не удалось выпустить сертификат. Проверьте, что порт 80 открыт."
-
-log "Установка сертификата в $CERT_DIR..."
-mkdir -p "$CERT_DIR"
-~/.acme.sh/acme.sh --installcert -d "$SERVER_IP" \
-  --certpath "$CERT_DIR/cert.pem" \
-  --keypath "$CERT_DIR/privkey.pem" \
-  --capath "$CERT_DIR/ca.pem" \
-  --fullchainpath "$CERT_DIR/fullchain.pem" \
-  --reloadcmd "x-ui restart" >/dev/null 2>&1 || warn "Не удалось установить сертификат."
-
-~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
-log "Сертификат установлен. Авто-обновление включено (cron)."
-
-# ---------- 6. Настройка панели на сертификат ----------
-log "Настройка путей к сертификату для панели 3x-ui..."
-/usr/local/x-ui/x-ui cert -webCert "$CERT_DIR/fullchain.pem" -webCertKey "$CERT_DIR/privkey.pem" >/dev/null 2>&1 || true
+# ---------- 6. Проверка сертификата (ставится самим install.sh через XUI_SSL_MODE=ip) ----------
+if [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]]; then
+  CERT_OK=1
+  log "SSL-сертификат на месте: $CERT_DIR"
+else
+  CERT_OK=0
+  warn "SSL-сертификат НЕ найден в $CERT_DIR."
+  warn "Скорее всего порт 80 недоступен снаружи (проверь firewall/security group у хостера, не только ufw)."
+  warn "Hysteria2 и VLESS TLS будут пропущены, пока сертификат не появится."
+  warn "После открытия порта 80 сертификат можно выпустить вручную: x-ui -> 16. SSL Certificate Management."
+fi
 
 # ---------- 7. Создание inbound'ов через API ----------
 log "Подключение к API панели..."
 COOKIE_JAR=$(mktemp)
-for i in $(seq 1 20); do
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PANEL_PORT/panel/" || true)
-  if [[ "$HTTP_CODE" =~ ^(200|302|401)$ ]]; then break; fi
-  sleep 2
-done
 
-curl -s -c "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/login" \
-  -d "username=$PANEL_USER&password=$PANEL_PASSWORD" >/dev/null 2>&1 || true
+LOGIN_RESPONSE="$(curl -s -c "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/login" \
+  -d "username=$PANEL_USER&password=$PANEL_PASSWORD" || true)"
+
+if echo "$LOGIN_RESPONSE" | grep -q '"success":true'; then
+  log "Успешный вход в панель."
+else
+  err "Не удалось залогиниться в панель. Ответ сервера:"
+  echo "$LOGIN_RESPONSE" >&2
+  err "Возможные причины: неверный webBasePath в URL (сверь вручную по Access URL из 'x-ui setting -show true'), либо панель ещё не полностью инициализировалась."
+  err "Дальнейшие шаги (создание inbound'ов) пропущены."
+fi
 
 # --- Inbound 1: VLESS Internal ---
 log "Создание VLESS Internal (2026, localhost)..."
-curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/add" \
+ADD_RESP_1=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
   -H "Content-Type: application/json" \
   -d "{
     \"listen\": \"127.0.0.1\",
@@ -236,9 +279,7 @@ curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbound
     \"tag\": \"in-2026-tcp\",
     \"settings\": {
       \"clients\": [],
-      \"decryption\": \"none\",
-      \"encryption\": \"none\",
-      \"testseed\": [900, 500, 900, 256]
+      \"decryption\": \"none\"
     },
     \"sniffing\": { \"enabled\": false },
     \"streamSettings\": {
@@ -249,127 +290,98 @@ curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbound
       },
       \"security\": \"none\"
     }
-  }" >/dev/null 2>&1 || warn "Не удалось создать VLESS Internal."
+  }" || true)
+echo "$ADD_RESP_1" | grep -q '"success":true' && log "VLESS Internal создан." || { warn "Не удалось создать VLESS Internal. Ответ:"; echo "$ADD_RESP_1" >&2; }
 
-# --- Inbound 2: Hysteria2 ---
-log "Создание Hysteria2 (8443/udp)..."
-curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/add" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"listen\": \"\",
-    \"port\": 8443,
-    \"protocol\": \"hysteria\",
-    \"tag\": \"in-8443-udp\",
-    \"settings\": { \"clients\": [], \"version\": 2 },
-    \"sniffing\": { \"enabled\": false },
-    \"streamSettings\": {
-      \"network\": \"hysteria\",
-      \"hysteriaSettings\": {
-        \"version\": 2,
-        \"udpIdleTimeout\": 60,
-        \"masquerade\": {
-          \"type\": \"\", \"dir\": \"\", \"url\": \"\", \"rewriteHost\": false,
-          \"insecure\": false, \"content\": \"\", \"headers\": {}, \"statusCode\": 0
-        }
-      },
-      \"security\": \"tls\",
-      \"tlsSettings\": {
-        \"serverName\": \"$SERVER_IP\",
-        \"minVersion\": \"1.2\",
-        \"maxVersion\": \"1.3\",
-        \"cipherSuites\": \"\",
-        \"rejectUnknownSni\": false,
-        \"disableSystemRoot\": false,
-        \"enableSessionResumption\": false,
-        \"certificates\": [{
-          \"certificateFile\": \"$CERT_DIR/fullchain.pem\",
-          \"keyFile\": \"$CERT_DIR/privkey.pem\",
-          \"ocspStapling\": 0,
-          \"oneTimeLoading\": false,
-          \"usage\": \"encipherment\",
-          \"buildChain\": false,
-          \"useFile\": true
-        }],
-        \"alpn\": [\"h3\", \"h2\", \"http/1.1\"],
-        \"echServerKeys\": \"\",
-        \"settings\": {
-          \"fingerprint\": \"firefox\",
-          \"echConfigList\": \"\",
-          \"pinnedPeerCertSha256\": [],
-          \"verifyPeerCertByName\": \"\"
-        }
-      },
-      \"finalmask\": {
-        \"udp\": [{
+# --- Inbound 2: Hysteria2 (только если есть сертификат) ---
+if [[ "$CERT_OK" -eq 1 ]]; then
+  log "Создание Hysteria2 (8443/udp)..."
+  # ВНИМАНИЕ: поле обфускации переименовано с "finalmask" на "obfs" —
+  # это наиболее вероятное правильное имя поля в текущей схеме 3x-ui,
+  # но нативная поддержка Hysteria2-inbound через это API в некоторых
+  # версиях 3x-ui ограничена (см. issue MHSanaei/3x-ui #3901 — раньше
+  # Hysteria2 как inbound иногда приходилось добавлять через "Custom
+  # Configuration" в самой панели). Если запрос всё равно не пройдёт —
+  # создай этот inbound руками через UI один раз и пришли мне точный
+  # JSON, который панель реально отправляет (вкладка Network в браузере) —
+  # поправим API-вызов под факт.
+  ADD_RESP_2=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"listen\": \"\",
+      \"port\": 8443,
+      \"protocol\": \"hysteria2\",
+      \"tag\": \"in-8443-udp\",
+      \"settings\": { \"clients\": [] },
+      \"sniffing\": { \"enabled\": false },
+      \"streamSettings\": {
+        \"network\": \"tcp\",
+        \"security\": \"tls\",
+        \"tlsSettings\": {
+          \"serverName\": \"$SERVER_IP\",
+          \"certificates\": [{
+            \"certificateFile\": \"$CERT_DIR/fullchain.pem\",
+            \"keyFile\": \"$CERT_DIR/privkey.pem\"
+          }]
+        },
+        \"obfs\": {
           \"type\": \"salamander\",
-          \"settings\": { \"password\": \"$HY2_PASSWORD\" }
-        }]
-      }
-    }
-  }" >/dev/null 2>&1 || warn "Не удалось создать Hysteria2."
-
-# --- Inbound 3: VLESS TLS ---
-log "Создание VLESS TLS ($CONNECT_PORT/tcp)..."
-curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/add" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"listen\": \"\",
-    \"port\": $CONNECT_PORT,
-    \"protocol\": \"vless\",
-    \"tag\": \"in-$CONNECT_PORT-tcp\",
-    \"settings\": {
-      \"clients\": [],
-      \"decryption\": \"none\",
-      \"encryption\": \"none\",
-      \"testseed\": [900, 500, 900, 256]
-    },
-    \"sniffing\": { \"enabled\": false },
-    \"streamSettings\": {
-      \"network\": \"tcp\",
-      \"tcpSettings\": {
-        \"acceptProxyProtocol\": false,
-        \"header\": { \"type\": \"none\" }
-      },
-      \"security\": \"tls\",
-      \"tlsSettings\": {
-        \"serverName\": \"$SERVER_IP\",
-        \"minVersion\": \"1.2\",
-        \"maxVersion\": \"1.3\",
-        \"cipherSuites\": \"\",
-        \"rejectUnknownSni\": false,
-        \"disableSystemRoot\": false,
-        \"enableSessionResumption\": false,
-        \"certificates\": [{
-          \"certificateFile\": \"$CERT_DIR/fullchain.pem\",
-          \"keyFile\": \"$CERT_DIR/privkey.pem\",
-          \"ocspStapling\": 0,
-          \"oneTimeLoading\": false,
-          \"usage\": \"encipherment\",
-          \"buildChain\": false,
-          \"useFile\": true
-        }],
-        \"alpn\": [\"h2\", \"http/1.1\"],
-        \"echServerKeys\": \"\",
-        \"settings\": {
-          \"fingerprint\": \"firefox\",
-          \"echConfigList\": \"\",
-          \"pinnedPeerCertSha256\": [],
-          \"verifyPeerCertByName\": \"\"
+          \"password\": \"$HY2_PASSWORD\"
         }
       }
-    }
-  }" >/dev/null 2>&1 || warn "Не удалось создать VLESS TLS."
+    }" || true)
+  echo "$ADD_RESP_2" | grep -q '"success":true' && log "Hysteria2 создан." || { warn "Не удалось создать Hysteria2. Ответ:"; echo "$ADD_RESP_2" >&2; }
+else
+  warn "Hysteria2 пропущен (нет сертификата)."
+fi
+
+# --- Inbound 3: VLESS TLS (только если есть сертификат) ---
+if [[ "$CERT_OK" -eq 1 ]]; then
+  log "Создание VLESS TLS ($CONNECT_PORT/tcp)..."
+  ADD_RESP_3=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"listen\": \"\",
+      \"port\": $CONNECT_PORT,
+      \"protocol\": \"vless\",
+      \"tag\": \"in-$CONNECT_PORT-tcp\",
+      \"settings\": {
+        \"clients\": [],
+        \"decryption\": \"none\"
+      },
+      \"sniffing\": { \"enabled\": false },
+      \"streamSettings\": {
+        \"network\": \"tcp\",
+        \"tcpSettings\": {
+          \"acceptProxyProtocol\": false,
+          \"header\": { \"type\": \"none\" }
+        },
+        \"security\": \"tls\",
+        \"tlsSettings\": {
+          \"serverName\": \"$SERVER_IP\",
+          \"certificates\": [{
+            \"certificateFile\": \"$CERT_DIR/fullchain.pem\",
+            \"keyFile\": \"$CERT_DIR/privkey.pem\"
+          }],
+          \"alpn\": [\"h2\", \"http/1.1\"]
+        }
+      }
+    }" || true)
+  echo "$ADD_RESP_3" | grep -q '"success":true' && log "VLESS TLS создан." || { warn "Не удалось создать VLESS TLS. Ответ:"; echo "$ADD_RESP_3" >&2; }
+else
+  warn "VLESS TLS пропущен (нет сертификата)."
+fi
 
 # ---------- 8. Клиенты ----------
 log "Получение списка inbound'ов..."
-INBOUNDS_JSON=$(curl -s -b "$COOKIE_JAR" "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/list" 2>/dev/null || echo '{}')
-INBOUND_2026_ID=$(echo "$INBOUNDS_JSON" | jq -r '.obj[] | select(.tag=="in-2026-tcp") | .id' 2>/dev/null || true)
-INBOUND_8443_ID=$(echo "$INBOUNDS_JSON" | jq -r '.obj[] | select(.tag=="in-8443-udp") | .id' 2>/dev/null || true)
-INBOUND_CONNECT_ID=$(echo "$INBOUNDS_JSON" | jq -r ".obj[] | select(.tag==\"in-$CONNECT_PORT-tcp\") | .id" 2>/dev/null || true)
+INBOUNDS_JSON=$(curl -s -b "$COOKIE_JAR" "${PANEL_BASE_URL}/panel/api/inbounds/list" 2>/dev/null || echo '{}')
+INBOUND_2026_ID=$(echo "$INBOUNDS_JSON" | jq -r '.obj[]? | select(.tag=="in-2026-tcp") | .id' 2>/dev/null || true)
+INBOUND_8443_ID=$(echo "$INBOUNDS_JSON" | jq -r '.obj[]? | select(.tag=="in-8443-udp") | .id' 2>/dev/null || true)
+INBOUND_CONNECT_ID=$(echo "$INBOUNDS_JSON" | jq -r ".obj[]? | select(.tag==\"in-$CONNECT_PORT-tcp\") | .id" 2>/dev/null || true)
 
 if [[ -n "$INBOUND_2026_ID" && "$INBOUND_2026_ID" != "null" ]]; then
   log "Добавление клиента в VLESS Internal..."
-  curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/addClient" \
+  curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/addClient" \
     -H "Content-Type: application/json" \
     -d "{\"id\": $INBOUND_2026_ID, \"settings\": \"{\\\"clients\\\":[{\\\"id\\\":\\\"$CLIENT_UUID\\\",\\\"email\\\":\\\"user@local\\\",\\\"subId\\\":\\\"$SUB_ID\\\"}]}\"}" \
     >/dev/null 2>&1 || warn "Не удалось добавить клиента в VLESS Internal."
@@ -377,7 +389,7 @@ fi
 
 if [[ -n "$INBOUND_CONNECT_ID" && "$INBOUND_CONNECT_ID" != "null" ]]; then
   log "Добавление клиента в VLESS TLS..."
-  curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/addClient" \
+  curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/addClient" \
     -H "Content-Type: application/json" \
     -d "{\"id\": $INBOUND_CONNECT_ID, \"settings\": \"{\\\"clients\\\":[{\\\"id\\\":\\\"$CLIENT_UUID\\\",\\\"email\\\":\\\"user@local\\\",\\\"subId\\\":\\\"$SUB_ID\\\"}]}\"}" \
     >/dev/null 2>&1 || warn "Не удалось добавить клиента в VLESS TLS."
@@ -385,7 +397,7 @@ fi
 
 if [[ -n "$INBOUND_8443_ID" && "$INBOUND_8443_ID" != "null" ]]; then
   log "Добавление клиента в Hysteria2..."
-  curl -s -b "$COOKIE_JAR" -X POST "http://127.0.0.1:$PANEL_PORT/panel/api/inbounds/addClient" \
+  curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/addClient" \
     -H "Content-Type: application/json" \
     -d "{\"id\": $INBOUND_8443_ID, \"settings\": \"{\\\"clients\\\":[{\\\"password\\\":\\\"$HY2_PASSWORD\\\",\\\"email\\\":\\\"user@local\\\",\\\"subId\\\":\\\"$SUB_ID\\\"}]}\"}" \
     >/dev/null 2>&1 || warn "Не удалось добавить клиента в Hysteria2."
@@ -394,7 +406,11 @@ fi
 rm -f "$COOKIE_JAR"
 
 # ---------- 9. Ссылки ----------
-SUB_URL="http://$SERVER_IP:$PANEL_PORT/sub/$SUB_ID"
+# Порт подписки: у 3x-ui по умолчанию 2096, но не гарантированно —
+# свериться можно в панели (Settings -> Subscription Settings).
+SUB_PORT=2096
+SUB_URL="http://$SERVER_IP:$SUB_PORT/sub/$SUB_ID"
+PANEL_URL="http://$SERVER_IP:$ACTUAL_PANEL_PORT/${ACTUAL_WEB_BASE_PATH}/"
 VLESS_INTERNAL_LINK="vless://$CLIENT_UUID@$SERVER_IP:2026?type=tcp&security=none&encryption=none#VLESS-Internal"
 VLESS_CONNECT_LINK="vless://$CLIENT_UUID@$SERVER_IP:$CONNECT_PORT?type=tcp&security=tls&encryption=none&sni=$SERVER_IP&fp=firefox#VLESS-TLS"
 HY2_LINK="hysteria2://$HY2_PASSWORD@$SERVER_IP:8443?insecure=1&sni=$SERVER_IP#Hysteria2"
@@ -405,16 +421,16 @@ echo -e "${BLUE}========================================${NC}"
 echo -e "${GREEN}✅ Развёртывание завершено!${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
-echo -e "  🌐 Панель:     ${GREEN}http://$SERVER_IP:$PANEL_PORT/panel${NC}"
+echo -e "  🌐 Панель:     ${GREEN}$PANEL_URL${NC}"
 echo -e "  👤 Логин:      ${GREEN}$PANEL_USER${NC}"
 echo -e "  🔑 Пароль:     ${GREEN}$PANEL_PASSWORD${NC}"
 echo ""
 echo -e "  📡 Inbound'ы:"
 echo -e "     • VLESS Internal:  порт ${GREEN}2026${NC} (127.0.0.1)"
-echo -e "     • Hysteria2:       порт ${GREEN}8443/udp${NC} (0.0.0.0)"
-echo -e "     • VLESS TLS:       порт ${GREEN}$CONNECT_PORT/tcp${NC} (0.0.0.0)"
+echo -e "     • Hysteria2:       порт ${GREEN}8443/udp${NC} (0.0.0.0)$( [[ $CERT_OK -eq 0 ]] && echo ' — пропущен (нет сертификата)')"
+echo -e "     • VLESS TLS:       порт ${GREEN}$CONNECT_PORT/tcp${NC} (0.0.0.0)$( [[ $CERT_OK -eq 0 ]] && echo ' — пропущен (нет сертификата)')"
 echo ""
-echo -e "  🔗 Ссылка подписки:"
+echo -e "  🔗 Ссылка подписки (порт $SUB_PORT — сверь в панели, если не откроется):"
 echo -e "     ${YELLOW}$SUB_URL${NC}"
 echo ""
 echo -e "  🔗 Прямые подключения:"
