@@ -195,6 +195,7 @@ ACTUAL_WEB_BASE_PATH_RAW="$(echo "$XUI_SETTINGS" | grep -E '^webBasePath:' | awk
 ACTUAL_WEB_BASE_PATH="$(echo "$ACTUAL_WEB_BASE_PATH_RAW" | sed 's#^/##; s#/$##')"
 
 # ---------- 3. Добавление в фаервол параметров панели ----------
+log "Настройка UFW под панель"
 ufw allow "$ACTUAL_PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
 ufw allow 2096/tcp comment '3x-ui subscription' >/dev/null 2>&1 || true
 ufw allow "$CONNECT_PORT/tcp" comment 'VLESS connect' >/dev/null 2>&1 || true
