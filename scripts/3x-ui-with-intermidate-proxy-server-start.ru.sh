@@ -158,7 +158,7 @@ ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming >/dev/null 2>&1 || true
 ufw default allow outgoing >/dev/null 2>&1 || true
 ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
-ufw allow 80/tcp comment "Let's Encrypt HTTP-01" >/dev/null 2>&1 || true
+ufw allow 80/tcp comment 'Lets Encrypt HTTP-01' >/dev/null 2>&1 || true
 ufw --force enable >/dev/null 2>&1 || true
 systemctl enable ufw >/dev/null 2>&1 || true
 log "UFW настроен и сохранён."
