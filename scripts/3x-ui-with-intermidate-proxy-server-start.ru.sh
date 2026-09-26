@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
-# 3x-ui Auto Deploy Script (v5 — исправленная версия)
-# Запуск (рекомендуется — не через <(...) с sudo, см. ниже):
-#   curl -Ls -o /tmp/3xui-deploy.sh https://raw.githubusercontent.com/vgit-inc/vpn-autodeploy/main/scripts/3x-ui-with-intermidate-proxy-server-start.ru.sh
-#   sudo bash /tmp/3xui-deploy.sh
+# 3x-ui Auto Deploy Script
 # ============================================================
 set -euo pipefail
-trap '' PIPE
+
 # ---------- Если запущено через pipe — перезапустить из файла ----------
 if [[ ! -t 0 ]] && [[ -z "${__SELF_RELAUNCHED:-}" ]]; then
   echo "[+] Обнаружен запуск через pipe. Перезапуск из файла..."
@@ -144,6 +141,8 @@ CERT_DIR="/root/cert/ip"
 CLIENT_UUID="$(cat /proc/sys/kernel/random/uuid)"
 SUB_ID="$(tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 16)" || true
 HY2_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16)" || true
+# Свой webBasePath — генерируем сами, а не даём install.sh выбрать случайный,
+# чтобы точно знать путь для последующих вызовов API и итоговой ссылки.
 WEB_BASE_PATH="$(tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c 18)" || true
 
 # ---------- 1. Обновление системы и зависимости ----------
@@ -253,21 +252,25 @@ fi
 log "Подключение к API панели..."
 COOKIE_JAR=$(mktemp)
 
-LOGIN_RESPONSE="$(curl -s -c "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/login" \
-  -d "username=$PANEL_USER&password=$PANEL_PASSWORD" || true)"
+log "URL логина: ${PANEL_BASE_URL}/login"
+LOGIN_RAW="$(curl -s -w '\n%{http_code}' -c "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/login" \
+  -d "username=$PANEL_USER&password=$PANEL_PASSWORD" 2>&1 || true)"
+LOGIN_HTTP_CODE="$(echo "$LOGIN_RAW" | tail -n1)"
+LOGIN_RESPONSE="$(echo "$LOGIN_RAW" | sed '$d')"
 
 if echo "$LOGIN_RESPONSE" | grep -q '"success":true'; then
-  log "Успешный вход в панель."
+  log "Успешный вход в панель (HTTP $LOGIN_HTTP_CODE)."
 else
-  err "Не удалось залогиниться в панель. Ответ сервера:"
-  echo "$LOGIN_RESPONSE" >&2
-  err "Возможные причины: неверный webBasePath в URL (сверь вручную по Access URL из 'x-ui setting -show true'), либо панель ещё не полностью инициализировалась."
+  err "Не удалось залогиниться в панель. HTTP-код: ${LOGIN_HTTP_CODE:-<нет ответа>}"
+  err "Тело ответа:"
+  echo "${LOGIN_RESPONSE:-<пусто — curl не получил ответ, проверь connectivity/URL>}" >&2
+  err "Возможные причины: неверный webBasePath в URL, панель ещё не полностью инициализировалась, либо curl вообще не достучался (см. HTTP-код выше)."
   err "Дальнейшие шаги (создание inbound'ов) пропущены."
 fi
 
 # --- Inbound 1: VLESS Internal ---
 log "Создание VLESS Internal (2026, localhost)..."
-ADD_RESP_1=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
+ADD_RAW_1=$(curl -s -w '\n%{http_code}' -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
   -H "Content-Type: application/json" \
   -d "{
     \"listen\": \"127.0.0.1\",
@@ -287,8 +290,10 @@ ADD_RESP_1=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbou
       },
       \"security\": \"none\"
     }
-  }" || true)
-echo "$ADD_RESP_1" | grep -q '"success":true' && log "VLESS Internal создан." || { warn "Не удалось создать VLESS Internal. Ответ:"; echo "$ADD_RESP_1" >&2; }
+  }" 2>&1 || true)
+ADD_CODE_1="$(echo "$ADD_RAW_1" | tail -n1)"
+ADD_RESP_1="$(echo "$ADD_RAW_1" | sed '$d')"
+echo "$ADD_RESP_1" | grep -q '"success":true' && log "VLESS Internal создан." || { warn "Не удалось создать VLESS Internal. HTTP: ${ADD_CODE_1:-<нет ответа>}. Ответ:"; echo "${ADD_RESP_1:-<пусто>}" >&2; }
 
 # --- Inbound 2: Hysteria2 (только если есть сертификат) ---
 if [[ "$CERT_OK" -eq 1 ]]; then
@@ -302,7 +307,7 @@ if [[ "$CERT_OK" -eq 1 ]]; then
   # создай этот inbound руками через UI один раз и пришли мне точный
   # JSON, который панель реально отправляет (вкладка Network в браузере) —
   # поправим API-вызов под факт.
-  ADD_RESP_2=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
+  ADD_RAW_2=$(curl -s -w '\n%{http_code}' -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
     -H "Content-Type: application/json" \
     -d "{
       \"listen\": \"\",
@@ -326,8 +331,10 @@ if [[ "$CERT_OK" -eq 1 ]]; then
           \"password\": \"$HY2_PASSWORD\"
         }
       }
-    }" || true)
-  echo "$ADD_RESP_2" | grep -q '"success":true' && log "Hysteria2 создан." || { warn "Не удалось создать Hysteria2. Ответ:"; echo "$ADD_RESP_2" >&2; }
+    }" 2>&1 || true)
+  ADD_CODE_2="$(echo "$ADD_RAW_2" | tail -n1)"
+  ADD_RESP_2="$(echo "$ADD_RAW_2" | sed '$d')"
+  echo "$ADD_RESP_2" | grep -q '"success":true' && log "Hysteria2 создан." || { warn "Не удалось создать Hysteria2. HTTP: ${ADD_CODE_2:-<нет ответа>}. Ответ:"; echo "${ADD_RESP_2:-<пусто>}" >&2; }
 else
   warn "Hysteria2 пропущен (нет сертификата)."
 fi
@@ -335,7 +342,7 @@ fi
 # --- Inbound 3: VLESS TLS (только если есть сертификат) ---
 if [[ "$CERT_OK" -eq 1 ]]; then
   log "Создание VLESS TLS ($CONNECT_PORT/tcp)..."
-  ADD_RESP_3=$(curl -s -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
+  ADD_RAW_3=$(curl -s -w '\n%{http_code}' -b "$COOKIE_JAR" -X POST "${PANEL_BASE_URL}/panel/api/inbounds/add" \
     -H "Content-Type: application/json" \
     -d "{
       \"listen\": \"\",
@@ -363,8 +370,10 @@ if [[ "$CERT_OK" -eq 1 ]]; then
           \"alpn\": [\"h2\", \"http/1.1\"]
         }
       }
-    }" || true)
-  echo "$ADD_RESP_3" | grep -q '"success":true' && log "VLESS TLS создан." || { warn "Не удалось создать VLESS TLS. Ответ:"; echo "$ADD_RESP_3" >&2; }
+    }" 2>&1 || true)
+  ADD_CODE_3="$(echo "$ADD_RAW_3" | tail -n1)"
+  ADD_RESP_3="$(echo "$ADD_RAW_3" | sed '$d')"
+  echo "$ADD_RESP_3" | grep -q '"success":true' && log "VLESS TLS создан." || { warn "Не удалось создать VLESS TLS. HTTP: ${ADD_CODE_3:-<нет ответа>}. Ответ:"; echo "${ADD_RESP_3:-<пусто>}" >&2; }
 else
   warn "VLESS TLS пропущен (нет сертификата)."
 fi
