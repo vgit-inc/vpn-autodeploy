@@ -158,14 +158,7 @@ ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming >/dev/null 2>&1 || true
 ufw default allow outgoing >/dev/null 2>&1 || true
 ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
-ufw allow "$ACTUAL_PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
 ufw allow 80/tcp comment "Let's Encrypt HTTP-01" >/dev/null 2>&1 || true
-ufw allow 443/tcp comment 'VLESS main' >/dev/null 2>&1 || true
-ufw allow 8443/udp comment 'Hysteria2' >/dev/null 2>&1 || true
-ufw allow "$CONNECT_PORT/tcp" comment 'VLESS connect' >/dev/null 2>&1 || true
-# Порт сервера подписок (по умолчанию у 3x-ui это 2096, но лучше свериться
-# в панели: Settings -> Subscription Settings -> Subscription Port).
-ufw allow 2096/tcp comment '3x-ui subscription' >/dev/null 2>&1 || true
 ufw --force enable >/dev/null 2>&1 || true
 systemctl enable ufw >/dev/null 2>&1 || true
 log "UFW настроен и сохранён."
@@ -200,6 +193,16 @@ ACTUAL_PANEL_PORT="$(echo "$XUI_SETTINGS" | grep -E '^port:' | awk -F': ' '{prin
 ACTUAL_WEB_BASE_PATH_RAW="$(echo "$XUI_SETTINGS" | grep -E '^webBasePath:' | awk -F': ' '{print $2}' | tr -d '[:space:]')"
 # webBasePath хранится в виде "/xxxxx/", для URL нам нужен вариант без лишних слэшей
 ACTUAL_WEB_BASE_PATH="$(echo "$ACTUAL_WEB_BASE_PATH_RAW" | sed 's#^/##; s#/$##')"
+
+# ---------- 3. Добавление в фаервол параметров панели ----------
+ufw allow "$ACTUAL_PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
+ufw allow 2096/tcp comment '3x-ui subscription' >/dev/null 2>&1 || true
+ufw allow "$CONNECT_PORT/tcp" comment 'VLESS connect' >/dev/null 2>&1 || true
+ufw allow 443/tcp comment 'VLESS main' >/dev/null 2>&1 || true
+ufw allow 8443/udp comment 'Hysteria2' >/dev/null 2>&1 || true
+ufw --force enable >/dev/null 2>&1 || true
+systemctl enable ufw >/dev/null 2>&1 || true
+
 
 if [[ -z "$ACTUAL_PANEL_PORT" ]]; then
   err "Не удалось определить реальный порт панели через 'x-ui setting -show true'."
