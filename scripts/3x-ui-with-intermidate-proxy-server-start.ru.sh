@@ -152,6 +152,24 @@ apt-get update -qq
 apt-get upgrade -y -qq
 apt-get install -y -qq curl wget tar ufw jq openssl cron socat >/dev/null 2>&1
 
+# ---------- 4. Файрвол ----------
+log "Настройка UFW..."
+ufw --force reset >/dev/null 2>&1 || true
+ufw default deny incoming >/dev/null 2>&1 || true
+ufw default allow outgoing >/dev/null 2>&1 || true
+ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
+ufw allow "$ACTUAL_PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
+ufw allow 80/tcp comment "Let's Encrypt HTTP-01" >/dev/null 2>&1 || true
+ufw allow 443/tcp comment 'VLESS main' >/dev/null 2>&1 || true
+ufw allow 8443/udp comment 'Hysteria2' >/dev/null 2>&1 || true
+ufw allow "$CONNECT_PORT/tcp" comment 'VLESS connect' >/dev/null 2>&1 || true
+# Порт сервера подписок (по умолчанию у 3x-ui это 2096, но лучше свериться
+# в панели: Settings -> Subscription Settings -> Subscription Port).
+ufw allow 2096/tcp comment '3x-ui subscription' >/dev/null 2>&1 || true
+ufw --force enable >/dev/null 2>&1 || true
+systemctl enable ufw >/dev/null 2>&1 || true
+log "UFW настроен и сохранён."
+
 # ---------- 2. Установка 3x-ui ----------
 ALREADY_INSTALLED=0
 if command -v x-ui >/dev/null 2>&1 || systemctl is-active --quiet x-ui 2>/dev/null; then
@@ -196,24 +214,6 @@ fi
 log "Фактический порт панели: $ACTUAL_PANEL_PORT"
 log "Фактический webBasePath: /${ACTUAL_WEB_BASE_PATH}/"
 PANEL_BASE_URL="http://127.0.0.1:${ACTUAL_PANEL_PORT}/${ACTUAL_WEB_BASE_PATH}"
-
-# ---------- 4. Файрвол ----------
-log "Настройка UFW..."
-ufw --force reset >/dev/null 2>&1 || true
-ufw default deny incoming >/dev/null 2>&1 || true
-ufw default allow outgoing >/dev/null 2>&1 || true
-ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
-ufw allow "$ACTUAL_PANEL_PORT/tcp" comment '3x-ui panel' >/dev/null 2>&1 || true
-ufw allow 80/tcp comment "Let's Encrypt HTTP-01" >/dev/null 2>&1 || true
-ufw allow 443/tcp comment 'VLESS main' >/dev/null 2>&1 || true
-ufw allow 8443/udp comment 'Hysteria2' >/dev/null 2>&1 || true
-ufw allow "$CONNECT_PORT/tcp" comment 'VLESS connect' >/dev/null 2>&1 || true
-# Порт сервера подписок (по умолчанию у 3x-ui это 2096, но лучше свериться
-# в панели: Settings -> Subscription Settings -> Subscription Port).
-ufw allow 2096/tcp comment '3x-ui subscription' >/dev/null 2>&1 || true
-ufw --force enable >/dev/null 2>&1 || true
-systemctl enable ufw >/dev/null 2>&1 || true
-log "UFW настроен и сохранён."
 
 # ---------- 5. Запуск 3x-ui и ожидание готовности ----------
 log "Запуск 3x-ui..."
