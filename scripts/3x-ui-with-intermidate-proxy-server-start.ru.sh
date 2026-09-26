@@ -164,11 +164,16 @@ systemctl enable ufw >/dev/null 2>&1 || true
 log "UFW настроен и сохранён."
 
 # ---------- 2. Установка 3x-ui ----------
-ALREADY_INSTALLED=0
 if command -v x-ui >/dev/null 2>&1 || systemctl is-active --quiet x-ui 2>/dev/null; then
   warn "3x-ui уже установлен. Пропускаем установку."
-  warn "Логин/пароль/порт/webBasePath из этого запуска НЕ применятся к уже существующей установке — ниже скрипт считает актуальные значения напрямую из настроек панели."
-  ALREADY_INSTALLED=1
+  printf "%b" "${BLUE}?${NC} Необходима переустановка, удалить текущую панель? [y/N]: " > "$TTY"
+  IFS= read -r CONFIRM < "$TTY" || true
+  if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    warn "Отменено пользователем."
+    exit 0
+    else 
+      x-ui uninstall 
+  fi
 else
   log "Установка 3x-ui (неинтерактивный режим)..."
   export XUI_NONINTERACTIVE=1
